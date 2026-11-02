@@ -1149,6 +1149,7 @@ struct SettingsView: View {
             if let warning = model.voiceKeyCompatibilityWarning {
                 voiceKeyCompatibilityWarningPanel(warning)
             }
+            ExternalBluetoothSettingsView(model: model, settings: settings)
             CompatibilityGlassContainer(spacing: 14) {
                 HStack(alignment: .top, spacing: 14) {
                     connectionDevicePanel
