@@ -801,6 +801,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private var mobileButtonGestureRecognizers: [UsageEventSource: RemoteButtonGestureRecognizer] = [:]
     private var mobileDoubleClickTimers: [MobileButtonGestureKey: DispatchSourceTimer] = [:]
     private var mobileLongPressTimers: [MobileButtonGestureKey: DispatchSourceTimer] = [:]
+    private var externalHIDMonitor: HIDRemoteMonitor?
     private var bluetoothBridges: [UUID: XiaomiBluetoothBridge] = [:]
     private var bluetoothBridgeStates: [ObjectIdentifier: BluetoothBridgeState] = [:]
     private var discoveryBluetoothBridge: XiaomiBluetoothBridge?
@@ -1483,6 +1484,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             ) { [weak self] _ in
                 guard let self else { return }
                 self.cancelConfiguredButtonInteractions(reason: "environment_changed")
+                self.externalHIDMonitor?.cancelConfiguredInteractions(reason: "environment_changed")
                 self.hidMonitors.values.forEach { $0.cancelConfiguredInteractions(reason: "environment_changed") }
                 self.discoveryHIDMonitor?.cancelConfiguredInteractions(reason: "environment_changed")
             })
@@ -3341,7 +3343,17 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             allowVoiceKeyModeFallback: allowVoiceKeyModeFallback
         )
         var powerKeySuppressed: Bool
-        if requestedFnTapMode, accessibilityGranted {
+        if settings.externalBluetoothConfiguration.mode == .ub500 {
+            // No native HID event exists for this transport; all voice keys use software injection.
+            voiceFunctionMapper.restore()
+            remoteNativeKeyMapper.restore()
+            powerKeySuppressed = true
+            voiceFnTapSession.setEnabled(requestedFnTapMode && accessibilityGranted)
+            isVoiceTriggerEnabled = accessibilityGranted
+            voiceShortcutStatus = LocalizedMessage(accessibilityGranted
+                ? "voice_button.status.\(settings.voiceKeyMode.rawValue)_enabled"
+                : "connection.voice_key_mode.command_permission")
+        } else if requestedFnTapMode, accessibilityGranted {
             powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: true)
             if voiceFunctionMapper.isVoiceKeyNeutralized {
                 voiceFnTapSession.setEnabled(true)
@@ -3496,6 +3508,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private func scheduleHIDMappingRecoveryIfNeeded(
         restartSiriRemote: Bool = true
     ) {
+        guard settings.externalBluetoothConfiguration.mode == .system else { return }
         guard hidMappingRecoveryWorkItem == nil else { return }
         guard let delay = HIDMappingRecoveryPolicy.retryDelay(
             forAttempt: hidMappingRecoveryAttempt,
@@ -3577,6 +3590,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
 
     private func startHIDMonitors(powerKeySuppressed: Bool) {
         stopHIDMonitors()
+        if settings.externalBluetoothConfiguration.mode == .ub500 { return }
         let backOnlyMode = !settings.customMappingEnabled && (
             settings.onboardingControlMethod == .physicalRemote ||
             settings.onboardingRemoteAvailability == .hasRemote ||
@@ -3675,6 +3689,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         for source in configuredButtonInteractions.keys.filter({ configuredButtonInteractionOwners[$0] == device }) {
             cancelConfiguredButtonInteractions(source: source, reason: reason)
         }
+        if externalHIDMonitor?.profileID == device { externalHIDMonitor?.cancelMappingInteractions() }
         hidMonitors.values.filter { $0.profileID == device }.forEach { $0.cancelMappingInteractions() }
         if discoveryHIDMonitor?.profileID == device { discoveryHIDMonitor?.cancelMappingInteractions() }
         if includeCompanionSources, settings.selectedRemoteProfileID == device {
@@ -3708,6 +3723,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func stopHIDMonitors() {
+        externalHIDMonitor?.stop()
+        externalHIDMonitor = nil
         hidMonitors.values.forEach { $0.stop() }
         discoveryHIDMonitor?.stop()
         hidMonitors.removeAll()
@@ -3717,6 +3734,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func startHIDDiscoveryIfNeeded(allowBackOnly: Bool = false) {
+        guard settings.externalBluetoothConfiguration.mode == .system else { return }
         guard (settings.customMappingEnabled || allowBackOnly), discoveryHIDMonitor == nil else { return }
         let monitor = makeHIDMonitor(
             profileID: nil,
@@ -3965,6 +3983,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func enableVoiceFnTapMode() {
+        if settings.externalBluetoothConfiguration.mode == .ub500 {
+            if !KeyboardInjector.isAccessibilityTrusted {
+                requestNextHIDPermissionIfNeeded(voiceFnTapModeRequested: true)
+            }
+            settings.voiceFnTapModeEnabled = KeyboardInjector.isAccessibilityTrusted
+            applyHIDSettings(restartSiriRemote: false)
+            return
+        }
         guard KeyboardInjector.isAccessibilityTrusted else {
             settings.voiceFnTapModeEnabled = false
             requestNextHIDPermissionIfNeeded(voiceFnTapModeRequested: true)
@@ -4232,7 +4258,48 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         return bluetoothBridges[identifier]
     }
 
+    /// Switching transport preserves the selected remote's existing mapping profile.
+    func applyExternalBluetoothConfiguration(_ draft: ExternalBluetoothConfiguration) {
+        guard !isStreaming, draft.isValid else { return }
+        var configuration = draft
+        if settings.externalBluetoothConfiguration.mode == .system, configuration.mode == .ub500,
+           let profile = settings.selectedRemoteProfile, !profile.model.usesPrivateAdapter,
+           let identifier = profile.bluetoothIdentifier {
+            configuration.identity = identifier
+        }
+        bluetoothBridges.values.forEach { $0.stop() }
+        discoveryBluetoothBridge?.stop()
+        bluetoothBridges.removeAll()
+        discoveryBluetoothBridge = nil
+        bluetoothBridgeStates.removeAll()
+        stopHIDMonitors()
+        settings.externalBluetoothConfiguration = configuration
+        AppLogger.shared.write("EXTERNAL_BLUETOOTH phase=changed result=applied mode=\(configuration.mode.rawValue)")
+        if started { startBluetoothConnections(); applyHIDSettings() }
+    }
+
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didReceiveExternalHIDReport data: Data) {
+        guard bridge.usesExternalTransport, case .ready = bridge.state,
+              let identifier = bridge.deviceIdentifier,
+              let profileID = settings.profileID(forBluetoothIdentifier: identifier) else { return }
+        if externalHIDMonitor == nil {
+            externalHIDMonitor = makeHIDMonitor(profileID: profileID,
+                                              targetFingerprint: "sayall.external.ub500")
+        }
+        externalHIDMonitor?.handleExternalReport(data)
+    }
+
     private func startBluetoothConnections() {
+        let configuration = settings.externalBluetoothConfiguration
+        if configuration.mode == .ub500 {
+            guard bluetoothBridges[configuration.identity] == nil else { return }
+            let bridge = XiaomiBluetoothBridge(settings: settings, delegate: self,
+                                               targetIdentifier: configuration.identity)
+            bluetoothBridges[configuration.identity] = bridge
+            bridge.setSystemSuspended(systemAudioSuspensionState.isSuspended, reason: "bridge_start")
+            bridge.start()
+            return
+        }
         let identifiers = Set(settings.remoteDeviceProfiles.compactMap(\.bluetoothIdentifier))
         for identifier in identifiers where bluetoothBridges[identifier] == nil {
             let bridge = XiaomiBluetoothBridge(
@@ -4251,6 +4318,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func startBluetoothDiscoveryIfNeeded() {
+        guard settings.externalBluetoothConfiguration.mode == .system else { return }
         guard started, discoveryBluetoothBridge == nil else { return }
         let bridge = XiaomiBluetoothBridge(
             settings: settings,
@@ -6162,6 +6230,15 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 scheduleHIDMappingRecoveryIfNeeded()
             }
         } else {
+            if bridge.usesExternalTransport {
+                if pendingBluetoothVoiceStartIdentifier == bridge.deviceIdentifier {
+                    pendingBluetoothVoiceStartIdentifier = nil
+                    pendingBluetoothVoiceStopRequested = false
+                    cancelPendingBluetoothVoiceAudio(reason: "external_disconnected")
+                }
+                externalHIDMonitor?.stop()
+                externalHIDMonitor = nil
+            }
             if readyBluetoothBridgeCount == 0 {
                 cancelHIDMappingRecovery(reason: "bluetooth_not_ready")
             }
@@ -6294,10 +6371,15 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         if settings.voiceKeyMode != .function || settings.voiceFnTapModeEnabled {
             applyHIDSettings(allowVoiceKeyModeFallback: false)
         }
+        if bridge.usesExternalTransport, !KeyboardInjector.isAccessibilityTrusted {
+            _ = bridge.requestMicrophoneClose()
+            bridge.audioDiagnostics?.rejectStart(reason: "external_accessibility_required")
+            return
+        }
         guard Self.canStartBluetoothVoice(
             mode: settings.voiceKeyMode,
             voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled,
-            isVoiceKeyNeutralized: voiceFunctionMapper.isVoiceKeyNeutralized
+            isVoiceKeyNeutralized: bridge.usesExternalTransport || voiceFunctionMapper.isVoiceKeyNeutralized
         ) else {
             _ = bridge.requestMicrophoneClose()
             bridge.audioDiagnostics?.rejectStart(reason: "voice_key_not_neutralized")
@@ -8570,7 +8652,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         let mode = streaming
             ? settings.voiceKeyMode
             : (heldVoiceKeyMode ?? pendingVoiceKeyMode ?? settings.voiceKeyMode)
-        guard forceSoftware || !mode.usesHardwareMapping else {
+        let externalVoice = owner == .bluetooth && settings.externalBluetoothConfiguration.mode == .ub500 &&
+            (mode != .function || !settings.voiceFnTapModeEnabled)
+        guard forceSoftware || externalVoice || !mode.usesHardwareMapping else {
             keyDiagnostic?.softwareKey(edge: edge, mode: mode.rawValue, result: "hardware_path_unobserved")
             return true
         }

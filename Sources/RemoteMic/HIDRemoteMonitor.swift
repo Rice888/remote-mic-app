@@ -861,6 +861,19 @@ final class HIDRemoteMonitor {
         return true
     }
 
+    /// Reports from a user-space USB transport cannot create native macOS HID events.
+    func handleExternalReport(_ data: Data) {
+        guard settings.customMappingEnabled, runtimePermissionsAreValid() else {
+            resetInputState()
+            return
+        }
+        deviceFingerprint = "sayall.external.ub500"
+        nativeKeysNeutralized = true
+        activeDeviceIsSeized = true
+        parseAndProcess(reportID: 1, data: data, source: "external_usb",
+                        timestampNanoseconds: monotonicNow())
+    }
+
     func handleSimulatedReport(reportID: UInt32, data: Data) {
         handleSimulatedReport(reportID: reportID, data: data, timestampNanoseconds: nil)
     }

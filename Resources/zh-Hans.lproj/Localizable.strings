@@ -1407,3 +1407,15 @@
 "audio.mac_microphone.voice_hold" = "按住说话，松开结束";
 "audio.mac_microphone.voice_toggle" = "按一下开始，再按一下结束";
 "audio.mac_microphone.error.input_monitoring" = "无法监听语音快捷键。请在系统设置中允许输入监控后重试。";
+
+// Independent external USB Bluetooth transport.
+"connection.external.title" = "小米遥控器连接方式（实验功能）";
+"connection.external.system" = "系统蓝牙";
+"connection.external.ub500" = "外置 UB500";
+"connection.external.description" = "通过 UB500 独立连接小米遥控器，复用当前按键映射和语音设置。系统蓝牙继续由 macOS 管理。首次连接需让遥控器进入配对模式。";
+"connection.external.address" = "遥控器蓝牙地址";
+"connection.external.choose_directory" = "选择后端目录…";
+"connection.external.setup_required" = "请先按测试手册安装外置后端，并填写有效地址。仅支持 TP-Link UB500（2357:0604）及已收录的小米遥控器；其他外设尚不支持。";
+"connection.external.apply" = "应用并重新连接";
+"connection.external.stop_voice_first" = "请先结束当前语音会话。";
+"connection.external.failed" = "外置连接失败。请检查后端、固件、USB 占用及遥控器配对状态，然后重试。";

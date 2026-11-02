@@ -84,3 +84,17 @@ The Doubao compatibility design is informed by MiRemoteVoice: a side-by-side Bla
 ## RC003 product photo
 
 The RC003 product photo bundled as `RC003-remote-photo.png` was supplied by the user on 2026-07-17 for the physical-button mapping interface. It is preserved at its original 508 x 1030 aspect ratio. Copyright and trademark rights in the photo and depicted products remain with their respective owners; the GPL-3.0-only license for the program does not grant additional rights to this image or the Xiaomi marks.
+
+## Bumble (optional external Bluetooth backend)
+
+- Project: `google/bumble`
+- Source: <https://github.com/google/bumble>
+- Pinned revision: `e1fe43c9b44be0d974a6fd533ac6d494fc50510a`
+- License: Apache License 2.0 (`Apache-2.0`)
+
+The optional user-space UB500 backend imports Bumble for USB HCI, the Realtek
+firmware loader, BLE pairing and GATT. The installer fetches the pinned source;
+Bumble source/binaries and Realtek firmware are not redistributed in this repository.
+Bumble and its dependencies retain their installed license notices. Firmware must
+be supplied separately by the user under its applicable license. The existing
+BTstack prototype is not included or required by this integration.

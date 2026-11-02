@@ -1408,3 +1408,15 @@
 "audio.mac_microphone.voice_hold" = "Hold to speak; release to finish";
 "audio.mac_microphone.voice_toggle" = "Press to start; press again to finish";
 "audio.mac_microphone.error.input_monitoring" = "Cannot observe the voice shortcut. Allow Input Monitoring in System Settings and retry.";
+
+// Independent external USB Bluetooth transport.
+"connection.external.title" = "Xiaomi remote transport (experimental)";
+"connection.external.system" = "System Bluetooth";
+"connection.external.ub500" = "External UB500";
+"connection.external.description" = "Connect a Xiaomi remote independently through UB500 using your existing button and voice settings. macOS continues to manage system Bluetooth. Enter pairing mode for the first connection.";
+"connection.external.address" = "Remote Bluetooth address";
+"connection.external.choose_directory" = "Choose backend folder…";
+"connection.external.setup_required" = "Install the external backend using the test guide and enter a valid address. Only TP-Link UB500 (2357:0604) and catalogued Xiaomi remotes are supported; other peripherals are not supported yet.";
+"connection.external.apply" = "Apply and reconnect";
+"connection.external.stop_voice_first" = "End the current voice session first.";
+"connection.external.failed" = "External connection failed. Check the backend, firmware, USB ownership and remote pairing mode, then retry.";

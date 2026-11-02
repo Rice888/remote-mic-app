@@ -34,6 +34,11 @@ protocol XiaomiBluetoothBridgeDelegate: AnyObject {
     func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didIdentifyRemoteModel model: XiaomiRemoteModel)
     func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didUpdatePowerState state: RemotePowerState?)
     func bluetoothBridgeDeviceNameDidChange(_ bridge: XiaomiBluetoothBridge)
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didReceiveExternalHIDReport data: Data)
+}
+
+extension XiaomiBluetoothBridgeDelegate {
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didReceiveExternalHIDReport data: Data) {}
 }
 
 private final class XiaomiPeripheralDelegateProxy: NSObject, CBPeripheralDelegate {
@@ -190,6 +195,11 @@ final class XiaomiBluetoothBridge: NSObject {
     private let deviceInformationServiceUUID = CBUUID(string: "180A")
     private let modelNumberUUID = CBUUID(string: "2A24")
 
+    private var externalTransport: ExternalBluetoothTransport?
+    private var externalModelVerified = false
+    private var externalSession = false
+    var usesExternalTransport: Bool { externalSession }
+
     var deviceIdentifier: UUID? {
         peripheral?.identifier ?? targetIdentifier
     }
@@ -258,6 +268,16 @@ final class XiaomiBluetoothBridge: NSObject {
     }
 
     func stop() {
+        if externalSession {
+            closeMicrophoneIfNeeded()
+            shouldRun = false
+            externalTransport?.stop()
+            externalTransport = nil
+            state = .stopped
+            resetPeripheral()
+            lifecycle = .stopped
+            return
+        }
         shouldRun = false
         reconnectWorkItem?.cancel()
         cancelScanTimeout()
@@ -278,6 +298,19 @@ final class XiaomiBluetoothBridge: NSObject {
 
     func reconnectNow() {
         guard shouldRun else { return }
+        if externalSession {
+            guard !systemSuspension.isSuspended else {
+                systemSuspension.markConnectionCycleNeeded()
+                return
+            }
+            externalTransport?.stop()
+            externalTransport = nil
+            state = .reconnecting
+            resetPeripheral()
+            lifecycle = .stopped
+            beginConnectionCycle()
+            return
+        }
         guard !systemSuspension.isSuspended else {
             systemSuspension.markConnectionCycleNeeded()
             AppLogger.shared.write(
@@ -373,10 +406,109 @@ final class XiaomiBluetoothBridge: NSObject {
         reconnectNow()
     }
 
+    private func beginExternalConnection() {
+        guard externalTransport == nil else { return }
+        externalSession = true
+        externalModelVerified = false
+        generationCounter &+= 1
+        let generation = generationCounter
+        lifecycle = .connecting(generation)
+        state = .connecting
+        let configuration = settings.externalBluetoothConfiguration
+        guard configuration.isValid, targetIdentifier == configuration.identity else {
+            failExternalConnection()
+            return
+        }
+        let transport = ExternalBluetoothTransport()
+        externalTransport = transport
+        AppLogger.shared.write("EXTERNAL_BLUETOOTH phase=requested result=connecting generation=\(generation)")
+        do {
+            try transport.start(configuration: configuration) { [weak self, weak transport] packet in
+                guard let self, let transport, self.shouldRun,
+                      self.externalTransport === transport,
+                      self.currentGeneration() == generation else { return }
+                self.receiveExternal(packet, generation: generation)
+            }
+        } catch {
+            failExternalConnection()
+        }
+    }
+
+    private func failExternalConnection(reason: String = "transport_or_protocol") {
+        externalTransport?.stop()
+        externalTransport = nil
+        initializationTimeoutWorkItem?.cancel()
+        state = .failed(LocalizedMessage("connection.external.failed"))
+        resetPeripheral()
+        lifecycle = .stopped
+        if systemSuspension.isSuspended { systemSuspension.markConnectionCycleNeeded() }
+        AppLogger.shared.write("EXTERNAL_BLUETOOTH phase=failed result=disconnected reason=\(reason)")
+    }
+
+    private func receiveExternal(_ packet: ExternalBluetoothPacket?, generation: UInt64) {
+        guard let packet else { failExternalConnection(); return }
+        switch packet.type {
+        case "model":
+            guard lifecycle == .connecting(generation) else { failExternalConnection(); return }
+            guard let data = packet.data, let value = String(data: data, encoding: .utf8),
+                  let model = XiaomiRemoteModel.identified(by: value) else {
+                failExternalConnection()
+                return
+            }
+            externalModelVerified = true
+            decoder.lowNibbleFirst = value.uppercased().contains("ARN9")
+            delegate?.bluetoothBridge(self, didIdentifyRemoteModel: model)
+        case "ready":
+            guard externalModelVerified, lifecycle == .connecting(generation) else {
+                failExternalConnection(); return
+            }
+            lifecycle = .awaitingCapabilities(generation)
+            state = .discovering
+            capabilitiesRequested = true
+            startInitializationTimeout(generation: generation)
+            if !write(ATVVProtocol.getCapabilitiesV10) { failExternalConnection() }
+        case "control":
+            guard let data = packet.data,
+                  lifecycle.acceptsCapabilities(generation: generation) ||
+                    lifecycle.acceptsProtocolData(generation: generation) else { return }
+            handleControl(data)
+        case "audio":
+            guard let data = packet.data, lifecycle.acceptsProtocolData(generation: generation) else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let diagnostic = diagnosticForAudio()
+            diagnostic.receive(bytes: data.count, frameSize: capabilities.frameSize, at: now)
+            handleAudio(data)
+            diagnostic.handlerFinished(since: now)
+        case "hid":
+            guard lifecycle.isReady else { return }
+            guard packet.report_id == 1, let data = packet.data,
+                  let normalized = ExternalBluetoothHID.normalize(data) else {
+                failExternalConnection(); return
+            }
+            delegate?.bluetoothBridge(self, didReceiveExternalHIDReport: normalized)
+        case "battery":
+            if let data = packet.data, data.count == 1, let value = data.first, value <= 100 {
+                delegate?.bluetoothBridge(self, didUpdateBatteryLevel: Int(value))
+            }
+        case "error":
+            let knownCodes = ["invalid_address", "firmware_missing", "required_characteristic_missing",
+                              "tx_not_writable", "hid_input_missing", "invalid_command",
+                              "initialization_timeout", "transport_overflow", "transport_failed"]
+            failExternalConnection(reason: knownCodes.contains(packet.code ?? "")
+                ? packet.code! : "backend_failed")
+        case "disconnected": failExternalConnection(reason: "remote_disconnected")
+        default: failExternalConnection()
+        }
+    }
+
     private func beginConnectionCycle() {
         guard shouldRun else { return }
         guard !systemSuspension.isSuspended else {
             systemSuspension.markConnectionCycleNeeded()
+            return
+        }
+        if settings.externalBluetoothConfiguration.mode == .ub500 {
+            beginExternalConnection()
             return
         }
         guard central == nil else { return }
@@ -827,6 +959,7 @@ final class XiaomiBluetoothBridge: NSObject {
 
     @discardableResult
     private func write(_ data: Data) -> Bool {
+        if externalSession { return externalTransport?.write(data) == true }
         guard let peripheral, let transmitCharacteristic else { return false }
         let type: CBCharacteristicWriteType = transmitCharacteristic.properties.contains(.writeWithoutResponse)
             ? .withoutResponse
@@ -962,7 +1095,9 @@ final class XiaomiBluetoothBridge: NSObject {
             reconnectPolicy.reset()
             currentAttemptUsesCachedTarget = false
             lifecycle = .ready(generation)
-            if let peripheral {
+            if externalSession {
+                state = .ready("UB500")
+            } else if let peripheral {
                 state = .ready(peripheral.name ?? "MI RC")
                 AppLogger.shared.write("BLE READY name=\(peripheral.name ?? "MI RC")")
             }
@@ -1134,6 +1269,7 @@ final class XiaomiBluetoothBridge: NSObject {
     }
 
     private func rejectUnsupportedAudio(_ message: LocalizedMessage) {
+        if externalSession { failExternalConnection(); return }
         diagnosticForAudio().rejectStart(reason: "unsupported_audio")
         state = .failed(message)
         closeMicrophoneIfNeeded()
@@ -1148,6 +1284,7 @@ final class XiaomiBluetoothBridge: NSObject {
     }
 
     private func failInitialization(_ message: LocalizedMessage) {
+        if externalSession { failExternalConnection(); return }
         state = .failed(message)
         accumulator.reset()
         pendingSync = nil
